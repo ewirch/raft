@@ -81,7 +81,10 @@ func NewHarness(t *testing.T, n int) *Harness {
 	for i := 0; i < n; i++ {
 		for j := 0; j < n; j++ {
 			if i != j {
-				ns[i].ConnectToPeer(j, ns[j].GetListenAddr())
+				err := ns[i].ConnectToPeer(j, ns[j].GetListenAddr())
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 		}
 		connected[i] = true
@@ -128,7 +131,10 @@ func (h *Harness) DisconnectPeer(id int) {
 	h.cluster[id].DisconnectAll()
 	for j := 0; j < h.n; j++ {
 		if j != id {
-			h.cluster[j].DisconnectPeer(id)
+			err := h.cluster[j].DisconnectPeer(id)
+			if err != nil {
+				h.t.Fatal(err)
+			}
 		}
 	}
 	h.connected[id] = false

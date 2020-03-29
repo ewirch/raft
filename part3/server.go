@@ -63,9 +63,11 @@ func (s *Server) Serve() {
 	// to n.cm
 	s.rpcServer = rpc.NewServer()
 	s.rpcProxy = &RPCProxy{cm: s.cm}
-	s.rpcServer.RegisterName("ConsensusModule", s.rpcProxy)
+	err := s.rpcServer.RegisterName("ConsensusModule", s.rpcProxy)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	var err error
 	s.listener, err = net.Listen("tcp", ":0")
 	if err != nil {
 		log.Fatal(err)
