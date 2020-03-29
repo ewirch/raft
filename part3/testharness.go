@@ -168,9 +168,13 @@ func (h *Harness) CrashPeer(id int) {
 	// Clear out the commits slice for the crashed server; Raft assumes the client
 	// has no persistent state. Once this server comes back online it will replay
 	// the whole log to us.
+	h.clearCommits(id)
+}
+
+func (h *Harness) clearCommits(id int) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.commits[id] = h.commits[id][:0]
-	h.mu.Unlock()
 }
 
 // RestartPeer "restarts" a server by creating a new Server instance and giving
@@ -354,9 +358,13 @@ func sleepMs(n int) {
 // separate goroutine. It returns when commitChans[i] is closed.
 func (h *Harness) collectCommits(i int) {
 	for c := range h.commitChans[i] {
-		h.mu.Lock()
-		tlog("collectCommits(%d) got %+v", i, c)
-		h.commits[i] = append(h.commits[i], c)
-		h.mu.Unlock()
+		h.appendCommits(i, c)
 	}
+}
+
+func (h *Harness) appendCommits(i int, c CommitEntry) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	tlog("collectCommits(%d) got %+v", i, c)
+	h.commits[i] = append(h.commits[i], c)
 }

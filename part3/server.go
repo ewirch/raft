@@ -56,24 +56,7 @@ func NewServer(serverId int, peerIds []int, storage Storage, ready <-chan interf
 }
 
 func (s *Server) Serve() {
-	s.mu.Lock()
-	s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.storage, s.ready, s.commitChan)
-
-	// Create a new RPC server and register a RPCProxy that forwards all methods
-	// to n.cm
-	s.rpcServer = rpc.NewServer()
-	s.rpcProxy = &RPCProxy{cm: s.cm}
-	err := s.rpcServer.RegisterName("ConsensusModule", s.rpcProxy)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	s.listener, err = net.Listen("tcp", ":0")
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("[%v] listening at %s", s.serverId, s.listener.Addr())
-	s.mu.Unlock()
+	s.createCmAndListen()
 
 	s.wg.Add(1)
 	go func() {
@@ -96,6 +79,28 @@ func (s *Server) Serve() {
 			}()
 		}
 	}()
+}
+
+func (s *Server) createCmAndListen() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.storage, s.ready, s.commitChan)
+
+	// Create a new RPC server and register a RPCProxy that forwards all methods
+	// to n.cm
+	s.rpcServer = rpc.NewServer()
+	s.rpcProxy = &RPCProxy{cm: s.cm}
+	err := s.rpcServer.RegisterName("ConsensusModule", s.rpcProxy)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	s.listener, err = net.Listen("tcp", ":0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("[%v] listening at %s", s.serverId, s.listener.Addr())
 }
 
 // DisconnectAll closes all the client connections to peers for this server.
@@ -150,9 +155,7 @@ func (s *Server) DisconnectPeer(peerId int) error {
 }
 
 func (s *Server) Call(id int, serviceMethod string, args interface{}, reply interface{}) error {
-	s.mu.Lock()
-	peer := s.peerClients[id]
-	s.mu.Unlock()
+	peer := s.getPeerClient(id)
 
 	// If this is called after shutdown (where client.Close is called), it will
 	// return an error.
@@ -161,6 +164,12 @@ func (s *Server) Call(id int, serviceMethod string, args interface{}, reply inte
 	} else {
 		return peer.Call(serviceMethod, args, reply)
 	}
+}
+
+func (s *Server) getPeerClient(id int) *rpc.Client {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.peerClients[id]
 }
 
 // RPCProxy is a trivial pass-thru proxy type for ConsensusModule's RPC methods.
