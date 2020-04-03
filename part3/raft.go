@@ -92,6 +92,10 @@ type ConsensusModule struct {
 	// sending new AEs to followers when interesting changes occurred.
 	triggerAEChan chan struct{}
 
+	// goRoutines receives new go routines, which should be started with ConsensusModule reference.
+	// A background go routine (goRoutinesStarter) reads this channel and starts the routines.
+	goRoutines chan func(cm *ConsensusModule)
+
 	// Persistent Raft state on all servers
 	currentTerm int
 	votedFor    int
@@ -121,6 +125,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, 
 	cm.commitChan = commitChan
 	cm.newCommitReadyChan = make(chan struct{}, 16)
 	cm.triggerAEChan = make(chan struct{}, 1)
+	cm.goRoutines = make(chan func(cm *ConsensusModule), 10)
 	cm.state = Follower
 	cm.votedFor = -1
 	cm.commitIndex = -1
@@ -132,6 +137,7 @@ func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, 
 		cm.restoreFromStorage()
 	}
 
+	go cm.goRoutinesStarter()
 	go func() {
 		// The CM is dormant until ready is signaled; then, it starts a countdown
 		// for leader election.
@@ -142,6 +148,13 @@ func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, 
 
 	go cm.commitChanSender()
 	return cm
+}
+
+func (cm *ConsensusModule) goRoutinesStarter() {
+	for routine := range cm.goRoutines {
+		go routine(cm)
+	}
+	cm.dlog("goRoutinesStarter done")
 }
 
 func (cm *ConsensusModule) resetElectionTimer() {
@@ -193,6 +206,7 @@ func (cm *ConsensusModule) Stop() {
 	cm.state = Dead
 	cm.dlog("becomes Dead")
 	close(cm.newCommitReadyChan)
+	close(cm.goRoutines)
 }
 
 // restoreFromStorage restores the persistent stat of this CM from storage.
@@ -491,11 +505,17 @@ func (cm *ConsensusModule) startElection() {
 
 	// Send RequestVote RPCs to all other servers concurrently.
 	for _, peerId := range cm.peerIds {
-		go cm.sendRequestVoteToPeer(peerId, savedCurrentTerm, &votesReceived)
+		// capture peerId to use in lambda
+		peerId := peerId
+		cm.goRoutines <- func(m *ConsensusModule) {
+			m.sendRequestVoteToPeer(peerId, savedCurrentTerm, &votesReceived)
+		}
 	}
 
 	// Run another election timer, in case this election is not successful.
-	go cm.runElectionTimer()
+	cm.goRoutines <- func(m *ConsensusModule) {
+		m.runElectionTimer()
+	}
 }
 
 func (cm *ConsensusModule) sendRequestVoteToPeer(peerId int, savedCurrentTerm int, votesReceived *int32) {
@@ -557,7 +577,9 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 	cm.votedFor = -1
 	cm.electionResetEvent = time.Now()
 
-	go cm.runElectionTimer()
+	cm.goRoutines <- func(m *ConsensusModule) {
+		m.runElectionTimer()
+	}
 }
 
 // startLeader switches cm into a leader state and begins process of heartbeats.
@@ -574,7 +596,9 @@ func (cm *ConsensusModule) startLeader() {
 	// This goroutine runs in the background and sends AEs to peers:
 	// * Whenever something is sent on triggerAEChan
 	// * ... Or every 50 ms, if no events occur on triggerAEChan
-	go cm.beLeader(50 * time.Millisecond)
+	cm.goRoutines <- func(m *ConsensusModule) {
+		m.beLeader(50 * time.Millisecond)
+	}
 }
 
 func (cm *ConsensusModule) beLeader(heartbeatTimeout time.Duration) {
@@ -624,10 +648,19 @@ func (cm *ConsensusModule) isLeader() bool {
 // leaderSendAEs sends a round of AEs to all peers, collects their
 // replies and adjusts cm's state.
 func (cm *ConsensusModule) leaderSendAEs() {
-	savedCurrentTerm := cm.getTerm()
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
 
+	if cm.state == Dead {
+		return
+	}
+	savedCurrentTerm := cm.currentTerm
 	for _, peerId := range cm.peerIds {
-		go cm.leaderSendAEsToPeer(savedCurrentTerm, peerId)
+		// capture peerId to use in lambda
+		peerId := peerId
+		cm.goRoutines <- func(m *ConsensusModule) {
+			m.leaderSendAEsToPeer(savedCurrentTerm, peerId)
+		}
 	}
 }
 
