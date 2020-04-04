@@ -491,26 +491,28 @@ func (cm *ConsensusModule) startElection() {
 
 	// Send RequestVote RPCs to all other servers concurrently.
 	for _, peerId := range cm.peerIds {
-		go func(peerId int) {
-			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTermLocked()
-
-			args := RequestVoteArgs{
-				Term:         savedCurrentTerm,
-				CandidateId:  cm.id,
-				LastLogIndex: savedLastLogIndex,
-				LastLogTerm:  savedLastLogTerm,
-			}
-
-			cm.dlog("sending RequestVote to %d: %+v", peerId, args)
-			var reply RequestVoteReply
-			if err := cm.server.Call(peerId, "ConsensusModule.RequestVote", args, &reply); err == nil {
-				cm.processRequestVoteReply(reply, savedCurrentTerm, &votesReceived)
-			}
-		}(peerId)
+		go cm.sendRequestVoteToPeer(peerId, savedCurrentTerm, &votesReceived)
 	}
 
 	// Run another election timer, in case this election is not successful.
 	go cm.runElectionTimer()
+}
+
+func (cm *ConsensusModule) sendRequestVoteToPeer(peerId int, savedCurrentTerm int, votesReceived *int32) {
+	savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTermLocked()
+
+	args := RequestVoteArgs{
+		Term:         savedCurrentTerm,
+		CandidateId:  cm.id,
+		LastLogIndex: savedLastLogIndex,
+		LastLogTerm:  savedLastLogTerm,
+	}
+
+	cm.dlog("sending RequestVote to %d: %+v", peerId, args)
+	var reply RequestVoteReply
+	if err := cm.server.Call(peerId, "ConsensusModule.RequestVote", args, &reply); err == nil {
+		cm.processRequestVoteReply(reply, savedCurrentTerm, votesReceived)
+	}
 }
 
 func (cm *ConsensusModule) processRequestVoteReply(reply RequestVoteReply, savedCurrentTerm int, votesReceived *int32) {
@@ -572,43 +574,45 @@ func (cm *ConsensusModule) startLeader() {
 	// This goroutine runs in the background and sends AEs to peers:
 	// * Whenever something is sent on triggerAEChan
 	// * ... Or every 50 ms, if no events occur on triggerAEChan
-	go func(heartbeatTimeout time.Duration) {
-		// Immediately send AEs to peers.
-		cm.leaderSendAEs()
+	go cm.beLeader(50 * time.Millisecond)
+}
 
-		t := time.NewTimer(heartbeatTimeout)
-		defer t.Stop()
-		for {
-			doSend := false
-			select {
-			case <-t.C:
+func (cm *ConsensusModule) beLeader(heartbeatTimeout time.Duration) {
+	// Immediately send AEs to peers.
+	cm.leaderSendAEs()
+
+	t := time.NewTimer(heartbeatTimeout)
+	defer t.Stop()
+	for {
+		doSend := false
+		select {
+		case <-t.C:
+			doSend = true
+
+			// Reset timer to fire again after heartbeatTimeout.
+			t.Stop()
+			t.Reset(heartbeatTimeout)
+		case _, ok := <-cm.triggerAEChan:
+			if ok {
 				doSend = true
-
-				// Reset timer to fire again after heartbeatTimeout.
-				t.Stop()
-				t.Reset(heartbeatTimeout)
-			case _, ok := <-cm.triggerAEChan:
-				if ok {
-					doSend = true
-				} else {
-					return
-				}
-
-				// Reset timer for heartbeatTimeout.
-				if !t.Stop() {
-					<-t.C
-				}
-				t.Reset(heartbeatTimeout)
+			} else {
+				return
 			}
 
-			if doSend {
-				if !cm.isLeader() {
-					return
-				}
-				cm.leaderSendAEs()
+			// Reset timer for heartbeatTimeout.
+			if !t.Stop() {
+				<-t.C
 			}
+			t.Reset(heartbeatTimeout)
 		}
-	}(50 * time.Millisecond)
+
+		if doSend {
+			if !cm.isLeader() {
+				return
+			}
+			cm.leaderSendAEs()
+		}
+	}
 }
 
 func (cm *ConsensusModule) isLeader() bool {
@@ -623,14 +627,16 @@ func (cm *ConsensusModule) leaderSendAEs() {
 	savedCurrentTerm := cm.getTerm()
 
 	for _, peerId := range cm.peerIds {
-		go func(peerId int) {
-			ni, args := cm.getAppendEntries(peerId, savedCurrentTerm)
-			cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, ni, args)
-			var reply AppendEntriesReply
-			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
-				cm.processSendAEsReply(peerId, reply, savedCurrentTerm, ni, args)
-			}
-		}(peerId)
+		go cm.leaderSendAEsToPeer(savedCurrentTerm, peerId)
+	}
+}
+
+func (cm *ConsensusModule) leaderSendAEsToPeer(savedCurrentTerm int, peerId int) {
+	ni, args := cm.getAppendEntries(peerId, savedCurrentTerm)
+	cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, ni, args)
+	var reply AppendEntriesReply
+	if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
+		cm.processSendAEsReply(peerId, reply, savedCurrentTerm, ni, args)
 	}
 }
 
