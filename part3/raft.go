@@ -11,7 +11,6 @@ import (
 	"log"
 	"math/rand"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -63,21 +62,54 @@ type LogEntry struct {
 
 // ConsensusModule (CM) implements a single node of Raft consensus.
 type ConsensusModule struct {
-	// mu protects concurrent access to a CM.
-	mu sync.Mutex
+	// Go routines use this channel to borrow the shared state object before access, this way
+	// concurrent go routines synchronize themselves. When they are done with the object,
+	// they return it. This guarantees that only one go routine at a time can access the
+	// shared state object. No data race can happen.
+	//
+	// There are some rules to be followed:
+	//
+	// 1. The shared state object should be borrowed by reading from the channel. The same
+	// method must return the borrowed object to the channel using 'defer' keyword.
+	//
+	// 2. The borrowing channel itself may not be part of the shared state object.
+	//
+	// 3. It must be impossible to try to borrow twice from the channel (in one singe go
+	// routine). Therefore, a method should have access to either the shared state object
+	// (mutableConsensusModule) or to the channel hosting the shared state object
+	// (ConsensusModule), but not to both at the same time. Exception: methods retrieving
+	// (and returning) the shared state object and delegating to shared state methods.
+	//
+	// 4. To simplify reasoning, the delegating methods should not contain any other logic.
+	// This prevents from accidentally leaking access to the borrowing channel in to
+	// shared state methods.
+	//
+	// 5. Shared state methods may not create other go routines and pass the shared state
+	// object reference to them (or references to any other variables from in shared
+	// state object). This would violate rule 1.
+	//
+	// Why not a mutex? It is hard to reason about whether a method runs in locked context
+	// (mutex was acquired), using mutexes. It easy if the method, you are looking at, locks
+	// the mutex; but if the method calls other methods, and those call other methods, it
+	// becomes harder. When you get back to your code months later, or when a coder
+	// unfamiliar with your code looks at it, it is hard to tell. You have to analyze call
+	// chains to find out if the method runs in a correctly locked context or not. This
+	// becomes a maintainability burden and a source of bugs.
+	//
+	// This problem does not arise using object borrowing. If the method has a reference to
+	// the object, it is allowed to access/modify the object. You can tell from the method
+	// declaration alone if the method runs in "locked" context.
+	//
+	// It is not clear which variables a mutex guards. Access to some variables is thread
+	// safe, to others is not. A shared state object groups them. It is clear, in order to
+	// get access to shared state variables, you have to get the shared state object.
+	mu chan *mutableConsensusModule
 
-	// id is the server ID of this CM.
-	id int
-
-	// peerIds lists the IDs of our peers in the cluster.
-	peerIds []int
+	sharedStaticConsensusModule
 
 	// server is the server containing this CM. It's used to issue RPC calls
 	// to peers.
 	server *Server
-
-	// storage is used to persist state.
-	storage Storage
 
 	// commitChan is the channel where this CM is going to report committed log
 	// entries. It's passed in by the client during construction.
@@ -91,10 +123,25 @@ type ConsensusModule struct {
 	// triggerAEChan is an internal notification channel used to trigger
 	// sending new AEs to followers when interesting changes occurred.
 	triggerAEChan chan struct{}
+}
+
+type sharedStaticConsensusModule struct {
+	// id is the server ID of this CM.
+	id int
+
+	// peerIds lists the IDs of our peers in the cluster.
+	peerIds []int
 
 	// goRoutines receives new go routines, which should be started with ConsensusModule reference.
 	// A background go routine (goRoutinesStarter) reads this channel and starts the routines.
 	goRoutines chan func(cm *ConsensusModule)
+}
+
+type mutableConsensusModule struct {
+	sharedStaticConsensusModule
+
+	// storage is used to persist state.
+	storage Storage
 
 	// Persistent Raft state on all servers
 	currentTerm int
@@ -117,24 +164,31 @@ type ConsensusModule struct {
 // it's safe to start its state machine. commitChan is going to be used by the
 // CM to send log entries that have been committed by the Raft cluster.
 func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
+	mutable := new(mutableConsensusModule)
+	mutable.id = id
+	mutable.peerIds = peerIds
+	mutable.storage = storage
+	mutable.state = Follower
+	mutable.votedFor = -1
+	mutable.commitIndex = -1
+	mutable.lastApplied = -1
+	mutable.nextIndex = make(map[int]int)
+	mutable.matchIndex = make(map[int]int)
+	mutable.goRoutines = make(chan func(cm *ConsensusModule), 10)
+
 	cm := new(ConsensusModule)
-	cm.id = id
-	cm.peerIds = peerIds
+	cm.id = mutable.id
+	cm.peerIds = mutable.peerIds
 	cm.server = server
-	cm.storage = storage
 	cm.commitChan = commitChan
 	cm.newCommitReadyChan = make(chan struct{}, 16)
 	cm.triggerAEChan = make(chan struct{}, 1)
-	cm.goRoutines = make(chan func(cm *ConsensusModule), 10)
-	cm.state = Follower
-	cm.votedFor = -1
-	cm.commitIndex = -1
-	cm.lastApplied = -1
-	cm.nextIndex = make(map[int]int)
-	cm.matchIndex = make(map[int]int)
+	cm.goRoutines = mutable.goRoutines
+	cm.mu = make(chan *mutableConsensusModule, 1)
+	cm.mu <- mutable
 
-	if cm.storage.HasData() {
-		cm.restoreFromStorage()
+	if mutable.storage.HasData() {
+		mutable.restoreFromStorage()
 	}
 
 	go cm.goRoutinesStarter()
@@ -158,16 +212,26 @@ func (cm *ConsensusModule) goRoutinesStarter() {
 }
 
 func (cm *ConsensusModule) resetElectionTimer() {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	cm.electionResetEvent = time.Now()
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
+}
+
+func (m *mutableConsensusModule) resetElectionTimer() {
+	m.electionResetEvent = time.Now()
 }
 
 // Report reports the state of this CM.
 func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	return cm.id, cm.currentTerm, cm.state == Leader
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
+
+	id = cm.id
+	term, isLeader = mutable.Report()
+	return
+}
+
+func (m *mutableConsensusModule) Report() (term int, isLeader bool) {
+	return m.currentTerm, m.state == Leader
 }
 
 // Submit submits a new command to the CM. This function doesn't block; clients
@@ -184,14 +248,18 @@ func (cm *ConsensusModule) Submit(command interface{}) bool {
 }
 
 func (cm *ConsensusModule) submitIfLeader(command interface{}) bool {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
 
-	cm.dlog("Submit received by %v: %v", cm.state, command)
-	if cm.state == Leader {
-		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
-		cm.persistToStorage()
-		cm.dlog("... log=%v", cm.log)
+	return mutable.submitIfLeader(command)
+}
+
+func (m *mutableConsensusModule) submitIfLeader(command interface{}) bool {
+	m.dlog("Submit received by %v: %v", m.state, command)
+	if m.state == Leader {
+		m.log = append(m.log, LogEntry{Command: command, Term: m.currentTerm})
+		m.persistToStorage()
+		m.dlog("... log=%v", m.log)
 		return true
 	}
 	return false
@@ -201,36 +269,41 @@ func (cm *ConsensusModule) submitIfLeader(command interface{}) bool {
 // it may take a bit of time (up to ~election timeout) for all goroutines to
 // exit.
 func (cm *ConsensusModule) Stop() {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	cm.state = Dead
-	cm.dlog("becomes Dead")
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
+
+	mutable.stop()
 	close(cm.newCommitReadyChan)
 	close(cm.goRoutines)
 }
 
+func (m *mutableConsensusModule) stop() {
+	m.state = Dead
+	m.dlog("becomes Dead")
+}
+
 // restoreFromStorage restores the persistent stat of this CM from storage.
 // It should be called during constructor, before any concurrency concerns.
-func (cm *ConsensusModule) restoreFromStorage() {
-	if termData, found := cm.storage.Get("currentTerm"); found {
+func (m *mutableConsensusModule) restoreFromStorage() {
+	if termData, found := m.storage.Get("currentTerm"); found {
 		d := gob.NewDecoder(bytes.NewBuffer(termData))
-		if err := d.Decode(&cm.currentTerm); err != nil {
+		if err := d.Decode(&m.currentTerm); err != nil {
 			log.Fatal(err)
 		}
 	} else {
 		log.Fatal("currentTerm not found in storage")
 	}
-	if votedData, found := cm.storage.Get("votedFor"); found {
+	if votedData, found := m.storage.Get("votedFor"); found {
 		d := gob.NewDecoder(bytes.NewBuffer(votedData))
-		if err := d.Decode(&cm.votedFor); err != nil {
+		if err := d.Decode(&m.votedFor); err != nil {
 			log.Fatal(err)
 		}
 	} else {
 		log.Fatal("votedFor not found in storage")
 	}
-	if logData, found := cm.storage.Get("log"); found {
+	if logData, found := m.storage.Get("log"); found {
 		d := gob.NewDecoder(bytes.NewBuffer(logData))
-		if err := d.Decode(&cm.log); err != nil {
+		if err := d.Decode(&m.log); err != nil {
 			log.Fatal(err)
 		}
 	} else {
@@ -240,30 +313,37 @@ func (cm *ConsensusModule) restoreFromStorage() {
 
 // persistToStorage saves all of CM's persistent state in cm.storage.
 // Expects cm.mu to be locked.
-func (cm *ConsensusModule) persistToStorage() {
+func (m *mutableConsensusModule) persistToStorage() {
 	var termData bytes.Buffer
-	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
+	if err := gob.NewEncoder(&termData).Encode(m.currentTerm); err != nil {
 		log.Fatal(err)
 	}
-	cm.storage.Set("currentTerm", termData.Bytes())
+	m.storage.Set("currentTerm", termData.Bytes())
 
 	var votedData bytes.Buffer
-	if err := gob.NewEncoder(&votedData).Encode(cm.votedFor); err != nil {
+	if err := gob.NewEncoder(&votedData).Encode(m.votedFor); err != nil {
 		log.Fatal(err)
 	}
-	cm.storage.Set("votedFor", votedData.Bytes())
+	m.storage.Set("votedFor", votedData.Bytes())
 
 	var logData bytes.Buffer
-	if err := gob.NewEncoder(&logData).Encode(cm.log); err != nil {
+	if err := gob.NewEncoder(&logData).Encode(m.log); err != nil {
 		log.Fatal(err)
 	}
-	cm.storage.Set("log", logData.Bytes())
+	m.storage.Set("log", logData.Bytes())
 }
 
 // dlog logs a debugging message is DebugCM > 0.
 func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
 	if DebugCM > 0 {
 		format = fmt.Sprintf("[%d] ", cm.id) + format
+		log.Printf(format, args...)
+	}
+}
+
+func (m *mutableConsensusModule) dlog(format string, args ...interface{}) {
+	if DebugCM > 0 {
+		format = fmt.Sprintf("[%d] ", m.id) + format
 		log.Printf(format, args...)
 	}
 }
@@ -283,32 +363,37 @@ type RequestVoteReply struct {
 
 // RequestVote RPC.
 func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	if cm.state == Dead {
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
+
+	return mutable.requestVote(args, reply)
+}
+
+func (m *mutableConsensusModule) requestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	if m.state == Dead {
 		return nil
 	}
-	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
-	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
+	lastLogIndex, lastLogTerm := m.lastLogIndexAndTerm()
+	m.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]", args, m.currentTerm, m.votedFor, lastLogIndex, lastLogTerm)
 
-	if args.Term > cm.currentTerm {
-		cm.dlog("... term out of date in RequestVote")
-		cm.becomeFollower(args.Term)
+	if args.Term > m.currentTerm {
+		m.dlog("... term out of date in RequestVote")
+		m.becomeFollower(args.Term)
 	}
 
-	if cm.currentTerm == args.Term &&
-		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) &&
+	if m.currentTerm == args.Term &&
+		(m.votedFor == -1 || m.votedFor == args.CandidateId) &&
 		(args.LastLogTerm > lastLogTerm ||
 			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
 		reply.VoteGranted = true
-		cm.votedFor = args.CandidateId
-		cm.electionResetEvent = time.Now()
+		m.votedFor = args.CandidateId
+		m.electionResetEvent = time.Now()
 	} else {
 		reply.VoteGranted = false
 	}
-	reply.Term = cm.currentTerm
-	cm.persistToStorage()
-	cm.dlog("... RequestVote reply: %+v", reply)
+	reply.Term = m.currentTerm
+	m.persistToStorage()
+	m.dlog("... RequestVote reply: %+v", reply)
 	return nil
 }
 
@@ -334,30 +419,44 @@ type AppendEntriesReply struct {
 }
 
 func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	if cm.state == Dead {
-		return nil
+	if cm.appendEntries(args, reply) {
+		cm.newCommitReadyChan <- struct{}{}
 	}
-	cm.dlog("AppendEntries: %+v", args)
+	return nil
+}
 
-	if args.Term > cm.currentTerm {
-		cm.dlog("... term out of date in AppendEntries")
-		cm.becomeFollower(args.Term)
+func (cm *ConsensusModule) appendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) (commitIndexChanged bool) {
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
+
+	return mutable.appendEntries(args, reply)
+}
+
+func (m *mutableConsensusModule) appendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) (commitIndexChanged bool) {
+	commitIndexChanged = false
+
+	if m.state == Dead {
+		return
+	}
+	m.dlog("AppendEntries: %+v", args)
+
+	if args.Term > m.currentTerm {
+		m.dlog("... term out of date in AppendEntries")
+		m.becomeFollower(args.Term)
 	}
 
 	reply.Success = false
-	if args.Term == cm.currentTerm {
-		if cm.state != Follower {
-			cm.becomeFollower(args.Term)
+	if args.Term == m.currentTerm {
+		if m.state != Follower {
+			m.becomeFollower(args.Term)
 		}
-		cm.electionResetEvent = time.Now()
+		m.electionResetEvent = time.Now()
 
 		// Does our log contain an entry at PrevLogIndex whose term matches
 		// PrevLogTerm? Note that in the extreme case of PrevLogIndex=-1 this is
 		// vacuously true.
 		if args.PrevLogIndex == -1 ||
-			(args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
+			(args.PrevLogIndex < len(m.log) && args.PrevLogTerm == m.log[args.PrevLogIndex].Term) {
 			reply.Success = true
 
 			// Find an insertion point - where there's a term mismatch between
@@ -367,10 +466,10 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			newEntriesIndex := 0
 
 			for {
-				if logInsertIndex >= len(cm.log) || newEntriesIndex >= len(args.Entries) {
+				if logInsertIndex >= len(m.log) || newEntriesIndex >= len(args.Entries) {
 					break
 				}
-				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
+				if m.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
 					break
 				}
 				logInsertIndex++
@@ -382,32 +481,32 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			// - newEntriesIndex points at the end of Entries, or an index where the
 			//   term mismatches with the corresponding log entry
 			if newEntriesIndex < len(args.Entries) {
-				cm.dlog("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
-				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
-				cm.dlog("... log is now: %v", cm.log)
+				m.dlog("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
+				m.log = append(m.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
+				m.dlog("... log is now: %v", m.log)
 			}
 
 			// Set commit index.
-			if args.LeaderCommit > cm.commitIndex {
-				cm.commitIndex = intMin(args.LeaderCommit, len(cm.log)-1)
-				cm.dlog("... setting commitIndex=%d", cm.commitIndex)
-				cm.newCommitReadyChan <- struct{}{}
+			if args.LeaderCommit > m.commitIndex {
+				m.commitIndex = intMin(args.LeaderCommit, len(m.log)-1)
+				m.dlog("... setting commitIndex=%d", m.commitIndex)
+				commitIndexChanged = true
 			}
 		} else {
 			// No match for PrevLogIndex/PrevLogTerm. Populate
 			// ConflictIndex/ConflictTerm to help the leader bring us up to date
 			// quickly.
-			if args.PrevLogIndex >= len(cm.log) {
-				reply.ConflictIndex = len(cm.log)
+			if args.PrevLogIndex >= len(m.log) {
+				reply.ConflictIndex = len(m.log)
 				reply.ConflictTerm = -1
 			} else {
 				// PrevLogIndex points within our log, but PrevLogTerm doesn't match
-				// cm.log[PrevLogIndex].
-				reply.ConflictTerm = cm.log[args.PrevLogIndex].Term
+				// m.log[PrevLogIndex].
+				reply.ConflictTerm = m.log[args.PrevLogIndex].Term
 
 				var i int
 				for i = args.PrevLogIndex - 1; i >= 0; i-- {
-					if cm.log[i].Term != reply.ConflictTerm {
+					if m.log[i].Term != reply.ConflictTerm {
 						break
 					}
 				}
@@ -416,10 +515,10 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		}
 	}
 
-	reply.Term = cm.currentTerm
-	cm.persistToStorage()
-	cm.dlog("AppendEntries reply: %+v", *reply)
-	return nil
+	reply.Term = m.currentTerm
+	m.persistToStorage()
+	m.dlog("AppendEntries reply: %+v", *reply)
+	return
 }
 
 // electionTimeout generates a pseudo-random election timeout duration.
@@ -463,29 +562,37 @@ func (cm *ConsensusModule) runElectionTimer() {
 }
 
 func (cm *ConsensusModule) getTerm() int {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	return cm.currentTerm
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
+	return mutable.getTerm()
+}
+
+func (m *mutableConsensusModule) getTerm() int {
+	return m.currentTerm
 }
 
 func (cm *ConsensusModule) electionTimerTick(termStarted int, timeoutDuration time.Duration) bool {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
 
-	if cm.state != Candidate && cm.state != Follower {
-		cm.dlog("in election timer state=%s, bailing out", cm.state)
+	return mutable.electionTimerTick(termStarted, timeoutDuration)
+}
+
+func (m *mutableConsensusModule) electionTimerTick(termStarted int, timeoutDuration time.Duration) bool {
+	if m.state != Candidate && m.state != Follower {
+		m.dlog("in election timer state=%s, bailing out", m.state)
 		return true
 	}
 
-	if termStarted != cm.currentTerm {
-		cm.dlog("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
+	if termStarted != m.currentTerm {
+		m.dlog("in election timer term changed from %d to %d, bailing out", termStarted, m.currentTerm)
 		return true
 	}
 
 	// Start an election if we haven't heard from a leader or haven't voted for
 	// someone for the duration of the timeout.
-	if elapsed := time.Since(cm.electionResetEvent); elapsed >= timeoutDuration {
-		cm.startElection()
+	if elapsed := time.Since(m.electionResetEvent); elapsed >= timeoutDuration {
+		m.startElection()
 		return true
 	}
 	return false
@@ -493,33 +600,33 @@ func (cm *ConsensusModule) electionTimerTick(termStarted int, timeoutDuration ti
 
 // startElection starts a new election with this CM as a candidate.
 // Expects cm.mu to be locked.
-func (cm *ConsensusModule) startElection() {
-	cm.state = Candidate
-	cm.currentTerm += 1
-	savedCurrentTerm := cm.currentTerm
-	cm.electionResetEvent = time.Now()
-	cm.votedFor = cm.id
-	cm.dlog("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
+func (m *mutableConsensusModule) startElection() {
+	m.state = Candidate
+	m.currentTerm += 1
+	savedCurrentTerm := m.currentTerm
+	m.electionResetEvent = time.Now()
+	m.votedFor = m.id
+	m.dlog("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, m.log)
 
 	var votesReceived int32 = 1
 
 	// Send RequestVote RPCs to all other servers concurrently.
-	for _, peerId := range cm.peerIds {
+	for _, peerId := range m.peerIds {
 		// capture peerId to use in lambda
 		peerId := peerId
-		cm.goRoutines <- func(m *ConsensusModule) {
-			m.sendRequestVoteToPeer(peerId, savedCurrentTerm, &votesReceived)
+		m.goRoutines <- func(cm *ConsensusModule) {
+			cm.sendRequestVoteToPeer(peerId, savedCurrentTerm, &votesReceived)
 		}
 	}
 
 	// Run another election timer, in case this election is not successful.
-	cm.goRoutines <- func(m *ConsensusModule) {
-		m.runElectionTimer()
+	m.goRoutines <- func(cm *ConsensusModule) {
+		cm.runElectionTimer()
 	}
 }
 
 func (cm *ConsensusModule) sendRequestVoteToPeer(peerId int, savedCurrentTerm int, votesReceived *int32) {
-	savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTermLocked()
+	savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
 
 	args := RequestVoteArgs{
 		Term:         savedCurrentTerm,
@@ -536,68 +643,73 @@ func (cm *ConsensusModule) sendRequestVoteToPeer(peerId int, savedCurrentTerm in
 }
 
 func (cm *ConsensusModule) processRequestVoteReply(reply RequestVoteReply, savedCurrentTerm int, votesReceived *int32) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	cm.dlog("received RequestVoteReply %+v", reply)
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
 
-	if cm.state != Candidate {
-		cm.dlog("while waiting for reply, state = %v", cm.state)
+	mutable.processRequestVoteReply(reply, savedCurrentTerm, votesReceived)
+}
+
+func (m *mutableConsensusModule) processRequestVoteReply(reply RequestVoteReply, savedCurrentTerm int, votesReceived *int32) {
+	m.dlog("received RequestVoteReply %+v", reply)
+
+	if m.state != Candidate {
+		m.dlog("while waiting for reply, state = %v", m.state)
 		return
 	}
 
 	if reply.Term > savedCurrentTerm {
-		cm.dlog("term out of date in RequestVoteReply")
-		cm.becomeFollower(reply.Term)
+		m.dlog("term out of date in RequestVoteReply")
+		m.becomeFollower(reply.Term)
 		return
 	} else if reply.Term == savedCurrentTerm {
 		if reply.VoteGranted {
 			votes := int(atomic.AddInt32(votesReceived, 1))
-			if votes*2 > len(cm.peerIds)+1 {
+			if votes*2 > len(m.peerIds)+1 {
 				// Won the election!
-				cm.dlog("wins election with %d votes", votes)
-				cm.startLeader()
+				m.dlog("wins election with %d votes", votes)
+				m.startLeader()
 				return
 			}
 		}
 	}
 }
 
-func (cm *ConsensusModule) lastLogIndexAndTermLocked() (int, int) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	return cm.lastLogIndexAndTerm()
+func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
+	return mutable.lastLogIndexAndTerm()
 }
 
 // becomeFollower makes cm a follower and resets its state.
 // Expects cm.mu to be locked.
-func (cm *ConsensusModule) becomeFollower(term int) {
-	cm.dlog("becomes Follower with term=%d; log=%v", term, cm.log)
-	cm.state = Follower
-	cm.currentTerm = term
-	cm.votedFor = -1
-	cm.electionResetEvent = time.Now()
+func (m *mutableConsensusModule) becomeFollower(term int) {
+	m.dlog("becomes Follower with term=%d; log=%v", term, m.log)
+	m.state = Follower
+	m.currentTerm = term
+	m.votedFor = -1
+	m.electionResetEvent = time.Now()
 
-	cm.goRoutines <- func(m *ConsensusModule) {
-		m.runElectionTimer()
+	m.goRoutines <- func(cm *ConsensusModule) {
+		cm.runElectionTimer()
 	}
 }
 
 // startLeader switches cm into a leader state and begins process of heartbeats.
 // Expects cm.mu to be locked.
-func (cm *ConsensusModule) startLeader() {
-	cm.state = Leader
+func (m *mutableConsensusModule) startLeader() {
+	m.state = Leader
 
-	for _, peerId := range cm.peerIds {
-		cm.nextIndex[peerId] = len(cm.log)
-		cm.matchIndex[peerId] = -1
+	for _, peerId := range m.peerIds {
+		m.nextIndex[peerId] = len(m.log)
+		m.matchIndex[peerId] = -1
 	}
-	cm.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
+	m.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v", m.currentTerm, m.nextIndex, m.matchIndex, m.log)
 
 	// This goroutine runs in the background and sends AEs to peers:
 	// * Whenever something is sent on triggerAEChan
 	// * ... Or every 50 ms, if no events occur on triggerAEChan
-	cm.goRoutines <- func(m *ConsensusModule) {
-		m.beLeader(50 * time.Millisecond)
+	m.goRoutines <- func(cm *ConsensusModule) {
+		cm.beLeader(50 * time.Millisecond)
 	}
 }
 
@@ -640,26 +752,34 @@ func (cm *ConsensusModule) beLeader(heartbeatTimeout time.Duration) {
 }
 
 func (cm *ConsensusModule) isLeader() bool {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	return cm.state == Leader
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
+	return mutable.isLeader()
+}
+
+func (m *mutableConsensusModule) isLeader() bool {
+	return m.state == Leader
 }
 
 // leaderSendAEs sends a round of AEs to all peers, collects their
 // replies and adjusts cm's state.
 func (cm *ConsensusModule) leaderSendAEs() {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	m := <-cm.mu
+	defer func() { cm.mu <- m }()
 
-	if cm.state == Dead {
+	m.leaderSendAEs()
+}
+
+func (m *mutableConsensusModule) leaderSendAEs() {
+	if m.state == Dead {
 		return
 	}
-	savedCurrentTerm := cm.currentTerm
-	for _, peerId := range cm.peerIds {
+	savedCurrentTerm := m.currentTerm
+	for _, peerId := range m.peerIds {
 		// capture peerId to use in lambda
 		peerId := peerId
-		cm.goRoutines <- func(m *ConsensusModule) {
-			m.leaderSendAEsToPeer(savedCurrentTerm, peerId)
+		m.goRoutines <- func(cm *ConsensusModule) {
+			cm.leaderSendAEsToPeer(savedCurrentTerm, peerId)
 		}
 	}
 }
@@ -669,86 +789,99 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(savedCurrentTerm int, peerId int)
 	cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, ni, args)
 	var reply AppendEntriesReply
 	if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
-		cm.processSendAEsReply(peerId, reply, savedCurrentTerm, ni, args)
+		if cm.processSendAEsReply(savedCurrentTerm, peerId, reply, ni, args) {
+			// Commit index changed: the leader considers new entries to be
+			// committed. Send new entries on the commit channel to this
+			// leader's clients, and notify followers by sending them AEs.
+			cm.newCommitReadyChan <- struct{}{}
+			cm.triggerAEChan <- struct{}{}
+		}
 	}
 }
 
-func (cm *ConsensusModule) processSendAEsReply(peerId int, reply AppendEntriesReply, savedCurrentTerm int, ni int, args AppendEntriesArgs) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+func (cm *ConsensusModule) processSendAEsReply(savedCurrentTerm int, peerId int, reply AppendEntriesReply, ni int, args AppendEntriesArgs) (commitIndexChanged bool) {
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
+
+	return mutable.processSendAEsReply(savedCurrentTerm, peerId, reply, ni, args)
+}
+
+func (m *mutableConsensusModule) processSendAEsReply(savedCurrentTerm int, peerId int, reply AppendEntriesReply, ni int, args AppendEntriesArgs) (commitIndexChanged bool) {
+	commitIndexChanged = false
 	if reply.Term > savedCurrentTerm {
-		cm.dlog("term out of date in heartbeat reply")
-		cm.becomeFollower(reply.Term)
+		m.dlog("term out of date in heartbeat reply")
+		m.becomeFollower(reply.Term)
 		return
 	}
 
-	if cm.state == Leader && savedCurrentTerm == reply.Term {
+	if m.state == Leader && savedCurrentTerm == reply.Term {
 		if reply.Success {
-			cm.nextIndex[peerId] = ni + len(args.Entries)
-			cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
+			m.nextIndex[peerId] = ni + len(args.Entries)
+			m.matchIndex[peerId] = m.nextIndex[peerId] - 1
 
-			savedCommitIndex := cm.commitIndex
-			for i := cm.commitIndex + 1; i < len(cm.log); i++ {
-				if cm.log[i].Term == cm.currentTerm {
+			savedCommitIndex := m.commitIndex
+			for i := m.commitIndex + 1; i < len(m.log); i++ {
+				if m.log[i].Term == m.currentTerm {
 					matchCount := 1
-					for _, peerId := range cm.peerIds {
-						if cm.matchIndex[peerId] >= i {
+					for _, peerId := range m.peerIds {
+						if m.matchIndex[peerId] >= i {
 							matchCount++
 						}
 					}
-					if matchCount*2 > len(cm.peerIds)+1 {
-						cm.commitIndex = i
+					if matchCount*2 > len(m.peerIds)+1 {
+						m.commitIndex = i
 					}
 				}
 			}
-			cm.dlog("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d", peerId, cm.nextIndex, cm.matchIndex, cm.commitIndex)
-			if cm.commitIndex != savedCommitIndex {
-				cm.dlog("leader sets commitIndex := %d", cm.commitIndex)
-				// Commit index changed: the leader considers new entries to be
-				// committed. Send new entries on the commit channel to this
-				// leader's clients, and notify followers by sending them AEs.
-				cm.newCommitReadyChan <- struct{}{}
-				cm.triggerAEChan <- struct{}{}
+			m.dlog("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d", peerId, m.nextIndex, m.matchIndex, m.commitIndex)
+			if m.commitIndex != savedCommitIndex {
+				m.dlog("leader sets commitIndex := %d", m.commitIndex)
+				return true
 			}
 		} else {
 			if reply.ConflictTerm >= 0 {
 				lastIndexOfTerm := -1
-				for i := len(cm.log) - 1; i >= 0; i-- {
-					if cm.log[i].Term == reply.ConflictTerm {
+				for i := len(m.log) - 1; i >= 0; i-- {
+					if m.log[i].Term == reply.ConflictTerm {
 						lastIndexOfTerm = i
 						break
 					}
 				}
 				if lastIndexOfTerm >= 0 {
-					cm.nextIndex[peerId] = lastIndexOfTerm + 1
+					m.nextIndex[peerId] = lastIndexOfTerm + 1
 				} else {
-					cm.nextIndex[peerId] = reply.ConflictIndex
+					m.nextIndex[peerId] = reply.ConflictIndex
 				}
 			} else {
-				cm.nextIndex[peerId] = reply.ConflictIndex
+				m.nextIndex[peerId] = reply.ConflictIndex
 			}
-			cm.dlog("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
+			m.dlog("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
 		}
 	}
+	return
 }
 
 func (cm *ConsensusModule) getAppendEntries(peerId int, term int) (int, AppendEntriesArgs) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
 
-	ni := cm.nextIndex[peerId]
+	return mutable.getAppendEntries(peerId, term)
+}
+
+func (m *mutableConsensusModule) getAppendEntries(peerId int, term int) (int, AppendEntriesArgs) {
+	ni := m.nextIndex[peerId]
 	prevLogIndex := ni - 1
 	prevLogTerm := -1
 	if prevLogIndex >= 0 {
-		prevLogTerm = cm.log[prevLogIndex].Term
+		prevLogTerm = m.log[prevLogIndex].Term
 	}
 	args := AppendEntriesArgs{
 		Term:         term,
-		LeaderId:     cm.id,
+		LeaderId:     m.id,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
-		Entries:      cm.log[ni:],
-		LeaderCommit: cm.commitIndex,
+		Entries:      m.log[ni:],
+		LeaderCommit: m.commitIndex,
 	}
 
 	return ni, args
@@ -757,10 +890,10 @@ func (cm *ConsensusModule) getAppendEntries(peerId int, term int) (int, AppendEn
 // lastLogIndexAndTerm returns the last log index and the last log entry's term
 // (or -1 if there's no log) for this server.
 // Expects cm.mu to be locked.
-func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
-	if len(cm.log) > 0 {
-		lastIndex := len(cm.log) - 1
-		return lastIndex, cm.log[lastIndex].Term
+func (m *mutableConsensusModule) lastLogIndexAndTerm() (int, int) {
+	if len(m.log) > 0 {
+		lastIndex := len(m.log) - 1
+		return lastIndex, m.log[lastIndex].Term
 	} else {
 		return -1, -1
 	}
@@ -790,14 +923,19 @@ func (cm *ConsensusModule) commitChanSender() {
 }
 
 func (cm *ConsensusModule) getCommittedAndUnsent() ([]LogEntry, int, int) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	savedTerm := cm.currentTerm
-	savedLastApplied := cm.lastApplied
+	mutable := <-cm.mu
+	defer func() { cm.mu <- mutable }()
+
+	return mutable.getCommittedAndUnsent()
+}
+
+func (m *mutableConsensusModule) getCommittedAndUnsent() ([]LogEntry, int, int) {
+	savedTerm := m.currentTerm
+	savedLastApplied := m.lastApplied
 	var entries []LogEntry
-	if cm.commitIndex > cm.lastApplied {
-		entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1]
-		cm.lastApplied = cm.commitIndex
+	if m.commitIndex > m.lastApplied {
+		entries = m.log[m.lastApplied+1 : m.commitIndex+1]
+		m.lastApplied = m.commitIndex
 	}
 	return entries, savedTerm, savedLastApplied
 }
