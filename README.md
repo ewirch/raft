@@ -1,3 +1,5 @@
+This is a refactoring for maintainability of the wonderful work @eliben did. Compare `refactor-for-maintainability` branch to `master` for changes.
+
 # :rowboat: Raft
 
 This is an instructional implementation of the Raft distributed consensus
